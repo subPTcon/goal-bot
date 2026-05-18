@@ -29,13 +29,13 @@ start_stream_monitor() {
   local output_file="$1"
   local label="$2"
 
-  python3 -u - "$output_file" "$label" "$LOG_FILE" <<'PY' &
+  python3 -u - "$output_file" "$label" "$LOG_FILE" "$AGENT" <<'PY' &
 import json
 import os
 import sys
 import time
 
-path, label, log_path = sys.argv[1], sys.argv[2], sys.argv[3]
+path, label, log_path, agent_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 offset = 0
 seen = set()
 
@@ -50,6 +50,21 @@ def shorten(text, limit=220):
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+def describe_changes(changes):
+    if not changes:
+        return ""
+    parts = []
+    for change in changes[:6]:
+        if isinstance(change, dict):
+            kind = change.get("kind") or "change"
+            path = change.get("path") or ""
+            parts.append(f"{kind}: {path}".strip())
+        else:
+            parts.append(str(change))
+    if len(changes) > 6:
+        parts.append(f"... +{len(changes) - 6} more")
+    return "; ".join(parts)
 
 def describe_tool(name, tool_input):
     tool_input = tool_input or {}
@@ -87,6 +102,7 @@ while True:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            emit(f"{agent_name} output: {shorten(line, 260)}")
             continue
 
         event_id = event.get("uuid") or line[:80]
@@ -95,8 +111,63 @@ while True:
         seen.add(event_id)
 
         event_type = event.get("type")
+        item = event.get("item") if isinstance(event.get("item"), dict) else None
+
+        if event_type == "thread.started":
+            emit(f"{agent_name} thread started: {event.get('thread_id')}")
+            continue
+
+        if event_type == "turn.started":
+            emit(f"{agent_name} turn started")
+            continue
+
+        if event_type == "turn.completed":
+            usage = event.get("usage") or {}
+            if usage:
+                emit(
+                    f"{agent_name} turn completed: "
+                    f"input={usage.get('input_tokens')} "
+                    f"cached={usage.get('cached_input_tokens')} "
+                    f"output={usage.get('output_tokens')} "
+                    f"reasoning={usage.get('reasoning_output_tokens')}"
+                )
+            else:
+                emit(f"{agent_name} turn completed")
+            continue
+
+        if item and event_type in ("item.started", "item.completed"):
+            item_type = item.get("type")
+            status = item.get("status")
+            prefix = "started" if event_type == "item.started" else "completed"
+
+            if item_type == "agent_message":
+                text = item.get("text") or ""
+                if text:
+                    emit(f"{agent_name} says: {shorten(text, 320)}")
+                continue
+
+            if item_type == "command_execution":
+                command = item.get("command") or ""
+                if event_type == "item.started":
+                    emit(f"{agent_name} command started: {shorten(command, 260)}")
+                else:
+                    output = item.get("aggregated_output") or ""
+                    exit_code = item.get("exit_code")
+                    emit(f"{agent_name} command completed: exit={exit_code} status={status} | {shorten(command, 180)}")
+                    if output:
+                        emit(f"{agent_name} command output: {shorten(output, 320)}")
+                continue
+
+            if item_type == "file_change":
+                changes = describe_changes(item.get("changes") or [])
+                emit(f"{agent_name} file change {prefix}: status={status} {changes}".strip())
+                continue
+
+            emit(f"{agent_name} item {prefix}: type={item_type} status={status}")
+            continue
+
         if event_type == "system" and event.get("subtype") == "init":
-            emit(f"claude init: cwd={event.get('cwd')} model={event.get('model')} permission={event.get('permissionMode')}")
+            emit(f"{agent_name} init: cwd={event.get('cwd')} model={event.get('model')} permission={event.get('permissionMode')}")
             continue
 
         if event_type == "assistant":
@@ -104,9 +175,26 @@ while True:
             for item in message.get("content") or []:
                 item_type = item.get("type")
                 if item_type == "text":
-                    emit(f"claude says: {shorten(item.get('text', ''), 260)}")
+                    emit(f"{agent_name} says: {shorten(item.get('text', ''), 260)}")
                 elif item_type == "tool_use":
-                    emit(f"claude tool: {describe_tool(item.get('name'), item.get('input'))}")
+                    emit(f"{agent_name} tool: {describe_tool(item.get('name'), item.get('input'))}")
+            continue
+
+        if event_type in ("agent_message", "assistant_message", "message"):
+            text = event.get("message") or event.get("text") or event.get("content")
+            if text:
+                emit(f"{agent_name} says: {shorten(text, 260)}")
+            continue
+
+        if event_type in ("exec_command_begin", "exec_command_start", "command_start"):
+            command = event.get("command") or event.get("cmd") or event.get("argv") or event.get("input")
+            emit(f"{agent_name} command: {shorten(command, 260)}")
+            continue
+
+        if event_type in ("exec_command_end", "exec_command_output", "command_end"):
+            output = event.get("output") or event.get("stdout") or event.get("stderr") or event.get("message")
+            if output:
+                emit(f"{agent_name} command output: {shorten(output, 260)}")
             continue
 
         if event_type == "user":
@@ -122,7 +210,7 @@ while True:
 
         if event_type == "result":
             emit(
-                "claude result: "
+                f"{agent_name} result: "
                 f"subtype={event.get('subtype')} "
                 f"turns={event.get('num_turns')} "
                 f"duration_ms={event.get('duration_ms')} "
@@ -130,6 +218,12 @@ while True:
                 f"terminal={event.get('terminal_reason')}"
             )
             continue
+
+        if event_type:
+            subtype = event.get("subtype")
+            message = event.get("message") or event.get("error") or event.get("status")
+            if message:
+                emit(f"{agent_name} event: type={event_type} subtype={subtype} {shorten(message, 180)}")
 
     time.sleep(0.5)
 PY
@@ -168,9 +262,9 @@ wait_with_heartbeat() {
           "$elapsed" \
           "$(wc -l < "$output_file" | tr -d ' ')" \
           "$current_bytes"
-        if [ "$CLAUDE_IDLE_TIMEOUT" -gt 0 ] && [ "$idle_for" -ge "$CLAUDE_IDLE_TIMEOUT" ]; then
-          echo "goal-bot: $label stream idle for ${idle_for}s; terminating claude child $CURRENT_CHILD_PID."
-          log_line "$label stream idle for ${idle_for}s; terminating claude child $CURRENT_CHILD_PID"
+        if [ "$AGENT_IDLE_TIMEOUT" -gt 0 ] && [ "$idle_for" -ge "$AGENT_IDLE_TIMEOUT" ]; then
+          echo "goal-bot: $label stream idle for ${idle_for}s; terminating agent child $CURRENT_CHILD_PID."
+          log_line "$label stream idle for ${idle_for}s; terminating agent child $CURRENT_CHILD_PID"
           kill -TERM "$CURRENT_CHILD_PID" >/dev/null 2>&1 || true
           sleep 3
           kill -KILL "$CURRENT_CHILD_PID" >/dev/null 2>&1 || true
@@ -218,11 +312,11 @@ run_command_capture() {
   printf '%s' "$status" > "$status_file"
 }
 
-extract_session_id() {
+extract_jsonl_session_id() {
   local json_file="$1"
 
   if command -v jq >/dev/null 2>&1; then
-    jq -r 'select(type == "object") | .session_id // .sessionId // empty' "$json_file" | tail -1
+    jq -R -r 'fromjson? | select(type == "object") | .session_id // .sessionId // .conversation_id // .conversationId // .thread_id // .threadId // empty' "$json_file" | tail -1
   else
     python3 - "$json_file" <<'PY'
 import json
@@ -235,33 +329,98 @@ session_id = ""
 if text:
     try:
         data = json.loads(text)
-        session_id = data.get("session_id") or data.get("sessionId") or ""
+        session_id = data.get("session_id") or data.get("sessionId") or data.get("conversation_id") or data.get("conversationId") or data.get("thread_id") or data.get("threadId") or ""
     except json.JSONDecodeError:
         for line in text.splitlines():
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            session_id = data.get("session_id") or data.get("sessionId") or session_id
+            session_id = data.get("session_id") or data.get("sessionId") or data.get("conversation_id") or data.get("conversationId") or data.get("thread_id") or data.get("threadId") or session_id
 
 print(session_id)
 PY
   fi
 }
 
-send_feedback() {
+agent_extract_session_id() {
+  local output_file="$1"
+  local extracted
+
+  extracted="$(extract_jsonl_session_id "$output_file")"
+  if [ -n "$extracted" ]; then
+    printf '%s' "$extracted"
+    return 0
+  fi
+
+  if [ "$AGENT" = "codex" ]; then
+    # Codex supports `codex exec resume --last`; some CLI versions do not emit
+    # a stable session id in JSONL. Use a sentinel to resume the latest session.
+    printf '%s' "__last__"
+    return 0
+  fi
+
+  return 1
+}
+
+agent_start() {
+  local prompt="$1"
+  local response_file="$2"
+
+  case "$AGENT" in
+    claude)
+      (
+        cd "$WORK_DIR" || exit 127
+        claude -p "$prompt" "${CLAUDE_INITIAL_ARGS[@]}"
+      ) > "$response_file" 2>&1 &
+      ;;
+    codex)
+      (
+        cd "$WORK_DIR" || exit 127
+        codex exec --json --skip-git-repo-check "${CODEX_INITIAL_ARGS[@]}" "$prompt"
+      ) > "$response_file" 2>&1 &
+      ;;
+    *)
+      die "unsupported agent: $AGENT"
+      ;;
+  esac
+
+  CURRENT_CHILD_PID=$!
+  wait_with_heartbeat "initial $AGENT run" "$response_file"
+}
+
+agent_resume() {
   local feedback="$1"
   local response_file="$2"
   local prompt
 
   prompt="$(build_feedback_prompt "$feedback")"
-  (
-    cd "$WORK_DIR" || exit 127
-    claude -p "$prompt" "${CLAUDE_FEEDBACK_ARGS[@]}" --resume "$SESSION_ID"
-  ) > "$response_file" 2>&1 &
+
+  case "$AGENT" in
+    claude)
+      (
+        cd "$WORK_DIR" || exit 127
+        claude -p "$prompt" "${CLAUDE_FEEDBACK_ARGS[@]}" --resume "$SESSION_ID"
+      ) > "$response_file" 2>&1 &
+      ;;
+    codex)
+      (
+        cd "$WORK_DIR" || exit 127
+        if [ "$SESSION_ID" = "__last__" ]; then
+          codex exec resume --last --json --skip-git-repo-check "${CODEX_FEEDBACK_ARGS[@]}" "$prompt"
+        else
+          codex exec resume --json --skip-git-repo-check "${CODEX_FEEDBACK_ARGS[@]}" "$SESSION_ID" "$prompt"
+        fi
+      ) > "$response_file" 2>&1 &
+      ;;
+    *)
+      die "unsupported agent: $AGENT"
+      ;;
+  esac
+
   CURRENT_CHILD_PID=$!
 
-  wait_with_heartbeat "claude feedback" "$response_file"
+  wait_with_heartbeat "$AGENT feedback" "$response_file"
 }
 
 build_initial_prompt() {
@@ -425,6 +584,7 @@ def parse_simple_yaml(path):
 data = parse_simple_yaml(goal_file)
 
 config = data.get("config") or {}
+agent_config = data.get("agent") or {}
 goal = data.get("goal") or {}
 setup = data.get("setup") or {}
 evaluate = data.get("evaluate") or {}
@@ -461,13 +621,14 @@ out = {
     "description": str(description),
     "setup_command": str(setup_command),
     "evaluate_command": str(evaluate_command),
+    "agent": str(config.get("agent", agent_config.get("provider", "claude"))).lower(),
     "max_iterations": int(config.get("max_iterations", 10)),
     "max_turns": int(config.get("max_turns_per_iteration", config.get("max_turns", 50))),
-    "max_turns_initial": int(config.get("max_turns_initial", config.get("max_turns_per_iteration", config.get("max_turns", 50)))),
-    "max_turns_feedback": int(config.get("max_turns_feedback", config.get("max_turns_per_iteration", config.get("max_turns", 50)))),
-    "claude_idle_timeout": int(config.get("claude_idle_timeout_seconds", 90)),
+    "max_turns_initial": int(config.get("max_turns_initial", agent_config.get("max_turns_initial", config.get("max_turns_per_iteration", config.get("max_turns", 50))))),
+    "max_turns_feedback": int(config.get("max_turns_feedback", agent_config.get("max_turns_feedback", config.get("max_turns_per_iteration", config.get("max_turns", 50))))),
+    "agent_idle_timeout": int(config.get("agent_idle_timeout_seconds", config.get("claude_idle_timeout_seconds", agent_config.get("idle_timeout_seconds", 90)))),
     "working_dir": working_dir,
-    "model": str(config.get("model") or ""),
+    "model": str(config.get("model", agent_config.get("model", "")) or ""),
 }
 print(json.dumps(out))
 PY
@@ -476,16 +637,28 @@ PY
 DESCRIPTION="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["description"])')"
 SETUP_COMMAND="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["setup_command"])')"
 EVALUATE_COMMAND="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["evaluate_command"])')"
+AGENT="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["agent"])')"
 MAX_ITERATIONS="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["max_iterations"])')"
 MAX_TURNS="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["max_turns"])')"
 MAX_TURNS_INITIAL="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["max_turns_initial"])')"
 MAX_TURNS_FEEDBACK="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["max_turns_feedback"])')"
-CLAUDE_IDLE_TIMEOUT="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["claude_idle_timeout"])')"
+AGENT_IDLE_TIMEOUT="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_idle_timeout"])')"
 WORK_DIR="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["working_dir"])')"
 MODEL="$(printf '%s' "$CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["model"])')"
 
 [ -d "$WORK_DIR" ] || die "working_dir not found: $WORK_DIR"
-command -v claude >/dev/null 2>&1 || die "claude command not found"
+
+case "$AGENT" in
+  claude)
+    command -v claude >/dev/null 2>&1 || die "claude command not found"
+    ;;
+  codex)
+    command -v codex >/dev/null 2>&1 || die "codex command not found"
+    ;;
+  *)
+    die "unsupported agent: $AGENT (expected claude or codex)"
+    ;;
+esac
 
 CLAUDE_COMMON_ARGS=(
   --output-format stream-json
@@ -501,47 +674,60 @@ fi
 CLAUDE_INITIAL_ARGS=(--max-turns "$MAX_TURNS_INITIAL" "${CLAUDE_COMMON_ARGS[@]}")
 CLAUDE_FEEDBACK_ARGS=(--max-turns "$MAX_TURNS_FEEDBACK" "${CLAUDE_COMMON_ARGS[@]}")
 
+CODEX_COMMON_ARGS=(
+  --cd "$WORK_DIR"
+  --sandbox workspace-write
+)
+
+if [ -n "$MODEL" ]; then
+  CODEX_COMMON_ARGS+=(--model "$MODEL")
+fi
+
+CODEX_INITIAL_ARGS=("${CODEX_COMMON_ARGS[@]}")
+CODEX_FEEDBACK_ARGS=()
+
+if [ -n "$MODEL" ]; then
+  CODEX_FEEDBACK_ARGS+=(--model "$MODEL")
+fi
+
 echo "goal-bot: work dir: $WORK_DIR"
+echo "goal-bot: agent: $AGENT"
 echo "goal-bot: max iterations: $MAX_ITERATIONS, initial turns: $MAX_TURNS_INITIAL, feedback turns: $MAX_TURNS_FEEDBACK"
-echo "goal-bot: claude idle timeout: ${CLAUDE_IDLE_TIMEOUT}s"
+echo "goal-bot: agent idle timeout: ${AGENT_IDLE_TIMEOUT}s"
 echo "goal-bot: log: $LOG_FILE"
 
 log_line "Started goal-bot"
 log_line "Goal file: $GOAL_FILE"
 log_line "Working dir: $WORK_DIR"
+log_line "Agent: $AGENT"
 log_line "Setup command: $SETUP_COMMAND"
 log_line "Evaluate command: $EVALUATE_COMMAND"
 
-INITIAL_RESPONSE="$LOG_DIR/claude-initial.json"
+INITIAL_RESPONSE="$LOG_DIR/$AGENT-initial.json"
 INITIAL_PROMPT="$(build_initial_prompt)"
-echo "goal-bot: starting initial claude run..."
-log_line "Starting initial claude run"
-(
-  cd "$WORK_DIR" || exit 127
-  claude -p "$INITIAL_PROMPT" "${CLAUDE_INITIAL_ARGS[@]}"
-) > "$INITIAL_RESPONSE" 2>&1 &
-CURRENT_CHILD_PID=$!
-if wait_with_heartbeat "initial claude run" "$INITIAL_RESPONSE"; then
-  CLAUDE_STATUS=0
+echo "goal-bot: starting initial $AGENT run..."
+log_line "Starting initial $AGENT run"
+if agent_start "$INITIAL_PROMPT" "$INITIAL_RESPONSE"; then
+  AGENT_STATUS=0
 else
-  CLAUDE_STATUS=$?
+  AGENT_STATUS=$?
 fi
 
 set +e
-SESSION_ID="$(extract_session_id "$INITIAL_RESPONSE")"
+SESSION_ID="$(agent_extract_session_id "$INITIAL_RESPONSE")"
 SESSION_EXTRACT_STATUS=$?
 set -e
 if [ "$SESSION_EXTRACT_STATUS" -ne 0 ]; then
-  die "could not parse initial claude JSON output; see $INITIAL_RESPONSE"
+  die "could not parse initial $AGENT JSON output; see $INITIAL_RESPONSE"
 fi
-[ -n "$SESSION_ID" ] || die "could not extract session_id from initial claude JSON output; see $INITIAL_RESPONSE"
-log_line "Claude session_id: $SESSION_ID"
+[ -n "$SESSION_ID" ] || die "could not extract session_id from initial $AGENT JSON output; see $INITIAL_RESPONSE"
+log_line "$AGENT session_id: $SESSION_ID"
 
-if [ "$CLAUDE_STATUS" -ne 0 ]; then
-  echo "goal-bot: initial claude run exited with code $CLAUDE_STATUS; continuing with setup/evaluate because session_id was captured."
-  log_line "Initial claude run exited with code $CLAUDE_STATUS; continuing with setup/evaluate"
+if [ "$AGENT_STATUS" -ne 0 ]; then
+  echo "goal-bot: initial $AGENT run exited with code $AGENT_STATUS; continuing with setup/evaluate because session_id was captured."
+  log_line "Initial $AGENT run exited with code $AGENT_STATUS; continuing with setup/evaluate"
 else
-  echo "goal-bot: initial claude run completed."
+  echo "goal-bot: initial $AGENT run completed."
 fi
 
 ITERATION=1
@@ -565,14 +751,14 @@ while [ "$ITERATION" -le "$MAX_ITERATIONS" ]; do
     } >> "$LOG_FILE"
 
     FEEDBACK="$(printf 'Iteration %s setup failed with exit code %s.\n\nSetup command:\n%s\n\nOutput:\n%s\n' "$ITERATION" "$SETUP_STATUS" "$SETUP_COMMAND" "$(cat "$SETUP_OUT")")"
-    CLAUDE_RESPONSE="$LOG_DIR/claude-feedback-$ITERATION.json"
-    echo "goal-bot: sending setup failure feedback to claude..."
-    log_line "Sending setup failure feedback to claude"
-    if ! send_feedback "$FEEDBACK" "$CLAUDE_RESPONSE"; then
-      echo "goal-bot: claude feedback exited nonzero; continuing to next setup/evaluate iteration."
-      log_line "Claude feedback call exited nonzero during iteration $ITERATION; continuing"
+    AGENT_RESPONSE="$LOG_DIR/$AGENT-feedback-$ITERATION.json"
+    echo "goal-bot: sending setup failure feedback to $AGENT..."
+    log_line "Sending setup failure feedback to $AGENT"
+    if ! agent_resume "$FEEDBACK" "$AGENT_RESPONSE"; then
+      echo "goal-bot: $AGENT feedback exited nonzero; continuing to next setup/evaluate iteration."
+      log_line "$AGENT feedback call exited nonzero during iteration $ITERATION; continuing"
     fi
-    echo "goal-bot: claude feedback run completed."
+    echo "goal-bot: $AGENT feedback run completed."
 
     ITERATION="$((ITERATION + 1))"
     continue
@@ -598,14 +784,14 @@ while [ "$ITERATION" -le "$MAX_ITERATIONS" ]; do
   fi
 
   FEEDBACK="$(printf 'Iteration %s evaluate failed with exit code %s.\n\nEvaluate command:\n%s\n\nOutput:\n%s\n' "$ITERATION" "$EVAL_STATUS" "$EVALUATE_COMMAND" "$(cat "$EVAL_OUT")")"
-  CLAUDE_RESPONSE="$LOG_DIR/claude-feedback-$ITERATION.json"
-  echo "goal-bot: sending evaluate failure feedback to claude..."
-  log_line "Sending evaluate failure feedback to claude"
-  if ! send_feedback "$FEEDBACK" "$CLAUDE_RESPONSE"; then
-    echo "goal-bot: claude feedback exited nonzero; continuing to next setup/evaluate iteration."
-    log_line "Claude feedback call exited nonzero during iteration $ITERATION; continuing"
+  AGENT_RESPONSE="$LOG_DIR/$AGENT-feedback-$ITERATION.json"
+  echo "goal-bot: sending evaluate failure feedback to $AGENT..."
+  log_line "Sending evaluate failure feedback to $AGENT"
+  if ! agent_resume "$FEEDBACK" "$AGENT_RESPONSE"; then
+    echo "goal-bot: $AGENT feedback exited nonzero; continuing to next setup/evaluate iteration."
+    log_line "$AGENT feedback call exited nonzero during iteration $ITERATION; continuing"
   fi
-  echo "goal-bot: claude feedback run completed."
+  echo "goal-bot: $AGENT feedback run completed."
 
   ITERATION="$((ITERATION + 1))"
 done

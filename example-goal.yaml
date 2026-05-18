@@ -8,7 +8,7 @@
 #   setup.command
 #   evaluate.command
 #
-# The current runner uses Claude Code through `claude -p`.
+# The current runner supports Claude Code and Codex.
 
 goal:
   name: "JSON Parser in C"
@@ -51,24 +51,27 @@ evaluate:
   command: "bash run_tests.sh"
 
 config:
+  # Coding agent to use: claude or codex.
+  agent: codex
+
   # Maximum outer setup/evaluate/fix loop iterations.
   max_iterations: 30
 
-  # Fallback Claude turn limit if the specific limits below are omitted.
+  # Fallback turn limit if the specific limits below are omitted.
   max_turns_per_iteration: 100
 
-  # Claude turn limit for the first implementation attempt.
+  # Turn limit for the first implementation attempt. Currently applied to Claude Code.
   max_turns_initial: 8
 
-  # Claude turn limit for each failure-feedback attempt.
+  # Turn limit for each failure-feedback attempt. Currently applied to Claude Code.
   max_turns_feedback: 6
 
-  # Kill a Claude call if its stream output stops growing for this many seconds.
+  # Kill an agent call if its stream output stops growing for this many seconds.
   # Set to 0 to disable idle timeout.
-  claude_idle_timeout_seconds: 90
+  agent_idle_timeout_seconds: 90
 
-  # Directory where Claude, setup.command, and evaluate.command run.
+  # Directory where the agent, setup.command, and evaluate.command run.
   working_dir: ./benchmarks/json-parser
 
-  # Passed to `claude --model`. Remove this field to use Claude Code's default.
-  model: sonnet
+  # Passed to `claude --model` or `codex --model`. Remove this field to use the agent default.
+  model: gpt-5.3-codex
