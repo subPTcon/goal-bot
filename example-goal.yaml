@@ -1,0 +1,45 @@
+# fix-loop.py 示例配置，格式参考 test-goal.yaml
+
+task:
+  在 app.py 里实现一个 POST /login 接口。
+  接受 JSON body { "username": str, "password": str }，
+  验证通过后返回 { "token": <JWT> }，失败返回 401。
+  不允许使用第三方鉴权库，需自行生成 token。
+
+criteria:
+  # 语法检查
+  - id: syntax
+    command: python -m py_compile app.py
+
+  # 单元测试
+  - id: unit_tests
+    command: pytest tests/test_login.py -v
+
+  # 正确凭据应返回 token
+  - id: login_success
+    command: >-
+      curl -s -X POST http://localhost:8000/login
+      -H "Content-Type: application/json"
+      -d '{"username":"admin","password":"secret"}'
+      | python -c "import sys,json; d=json.load(sys.stdin); assert 'token' in d"
+
+  # 错误凭据应返回 401
+  - id: login_fail_status
+    command: >-
+      curl -s -o /dev/null -w "%{http_code}"
+      -X POST http://localhost:8000/login
+      -H "Content-Type: application/json"
+      -d '{"username":"admin","password":"wrong"}'
+    expect: "401"
+
+  # 端到端冒烟测试
+  - id: integration
+    command: bash tests/integration.sh
+
+config:
+  max_iterations: 8
+  max_turns_per_iteration: 50
+  working_dir: ./workspace/login
+  model: sonnet
+
+budget_usd: 0.50
